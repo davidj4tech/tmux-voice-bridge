@@ -1,0 +1,341 @@
+"""Voice-injection shim for tmux panes over HA Assist.
+
+Tool-agnostic: whatever TUI is running in the target pane (Claude Code,
+Codex, aider, a shell) receives the transcript as keystrokes. Exposes an
+OpenAI-compatible /v1/chat/completions endpoint. Each incoming user
+message is parsed against a small command grammar:
+
+    switch to <target> [<session>]  -> change current target, confirm via TTS
+    use <target> [<session>]        -> alias for switch
+    go to <target> [<session>]      -> alias for switch
+    where am i | current ...        -> speak current target via TTS
+
+Anything else is injected into the current tmux target (local or SSH remote)
+using tmux's paste-buffer mechanism, which avoids shell-escaping the message.
+The shim returns a single space for injections so HA's TTS stays silent;
+the target tool's own Stop hook (or equivalent) handles spoken replies.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+def _state_dir() -> Path:
+    root = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(root) / "tmux-voice-bridge"
+
+
+def _config_dir() -> Path:
+    root = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(root) / "tmux-voice-bridge"
+
+
+PORT = int(os.environ.get("TMUX_VOICE_PORT", "18790"))
+BIND = os.environ.get("TMUX_VOICE_BIND", "127.0.0.1")
+TARGET_FILE = Path(os.environ.get(
+    "TMUX_VOICE_TARGET_FILE",
+    str(_state_dir() / "target"),
+))
+HOSTS_FILE = Path(os.environ.get(
+    "TMUX_VOICE_HOSTS_FILE",
+    str(_config_dir() / "hosts.json"),
+))
+DEFAULT_TARGET = "local main"
+
+# Default host map if no hosts.json is present. Keys are the tokens a user
+# can say; values are the ssh config host to use (None = local tmux).
+DEFAULT_HOSTS: dict[str, str | None] = {
+    "local": None,
+    "here": None,
+}
+
+NUMBER_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+
+
+def load_hosts() -> dict[str, str | None]:
+    if HOSTS_FILE.exists():
+        try:
+            raw = json.loads(HOSTS_FILE.read_text())
+            return {**DEFAULT_HOSTS, **{k: v for k, v in raw.items()}}
+        except json.JSONDecodeError as err:
+            print(f"[shim] bad hosts.json ({err}); using defaults", file=sys.stderr)
+    return dict(DEFAULT_HOSTS)
+
+
+def load_target() -> tuple[str | None, str]:
+    try:
+        raw = TARGET_FILE.read_text().strip()
+    except FileNotFoundError:
+        raw = DEFAULT_TARGET
+    parts = raw.split()
+    if len(parts) == 2 and parts[0] == "local":
+        return None, parts[1]
+    if len(parts) == 3 and parts[0] == "ssh":
+        return parts[1], parts[2]
+    return None, "main"
+
+
+def save_target(host: str | None, session: str) -> None:
+    TARGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    line = f"local {session}" if host is None else f"ssh {host} {session}"
+    TARGET_FILE.write_text(line + "\n")
+
+
+def describe_target(host: str | None, session: str) -> str:
+    return f"local session {session}" if host is None else f"{host} session {session}"
+
+
+SWITCH_RE = re.compile(
+    r"^\s*(?:switch\s+to|use|go\s+to)\s+([a-z0-9]+)(?:\s+([a-z0-9][a-z0-9_\-]*))?\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+WHERE_RE = re.compile(
+    r"^\s*(?:where\s+am\s+i|current\s+target|what\s+target|where\s+are\s+we)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_session_token(tok: str | None) -> str:
+    if not tok:
+        return "main"
+    tok = tok.lower()
+    if tok in NUMBER_WORDS:
+        return str(NUMBER_WORDS[tok])
+    return tok
+
+
+def handle_command(text: str, hosts: dict[str, str | None]) -> str | None:
+    """Return a spoken response if text matched a command, else None."""
+    m = SWITCH_RE.match(text)
+    if m:
+        token = m.group(1).lower()
+        if token not in hosts:
+            known = ", ".join(sorted(hosts)) or "(no hosts configured)"
+            return f"Unknown target {token}. Try: {known}."
+        host = hosts[token]
+        session = parse_session_token(m.group(2))
+        save_target(host, session)
+        return f"Switched to {describe_target(host, session)}."
+    if WHERE_RE.match(text):
+        host, session = load_target()
+        return f"Current target is {describe_target(host, session)}."
+    return None
+
+
+def inject_local(session: str, text: str) -> None:
+    target = f"{session}:1.1"
+    buf = f"voice-{uuid.uuid4().hex[:8]}"
+    subprocess.run(
+        ["tmux", "load-buffer", "-b", buf, "-"],
+        input=text.encode(), check=True,
+    )
+    subprocess.run(["tmux", "send-keys", "-t", target, "C-u"], check=True)
+    subprocess.run(
+        ["tmux", "paste-buffer", "-b", buf, "-d", "-t", target],
+        check=True,
+    )
+    subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
+
+
+def inject_remote(host: str, session: str, text: str) -> None:
+    target = f"{session}:1.1"
+    buf = f"voice-{uuid.uuid4().hex[:8]}"
+    remote = (
+        f"tmux load-buffer -b {buf} - && "
+        f"tmux send-keys -t {target} C-u && "
+        f"tmux paste-buffer -b {buf} -d -t {target} && "
+        f"tmux send-keys -t {target} Enter"
+    )
+    subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", host, remote],
+        input=text.encode(), check=True,
+    )
+
+
+def do_inject(text: str) -> None:
+    host, session = load_target()
+    if host is None:
+        inject_local(session, text)
+    else:
+        inject_remote(host, session, text)
+
+
+def extract_user_text(body: dict) -> str:
+    messages = body.get("messages") or []
+    for m in reversed(messages):
+        if m.get("role") != "user":
+            continue
+        content = m.get("content", "")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for p in content:
+                if isinstance(p, dict) and isinstance(p.get("text"), str):
+                    parts.append(p["text"])
+            return "".join(parts).strip()
+        return str(content).strip()
+    return ""
+
+
+def build_completion(content: str, body: dict) -> tuple[dict, list[dict]]:
+    """Return (non_stream_payload, stream_chunks) for the given assistant content."""
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    model = body.get("model") or "tmux-voice-bridge"
+    non_stream = {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+    chunks = [
+        {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": content},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+    ]
+    return non_stream, chunks
+
+
+def make_handler(hosts: dict[str, str | None]):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args) -> None:
+            print(f"[shim] {fmt % args}", file=sys.stderr, flush=True)
+
+        def _send_json(self, payload: dict, status: int = 200) -> None:
+            data = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self) -> None:
+            path = self.path.rstrip("/")
+            if path in ("", "/"):
+                self._send_json({"status": "ok", "service": "tmux-voice-bridge"})
+                return
+            if path == "/v1/models":
+                self._send_json({
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "tmux-voice-bridge",
+                            "object": "model",
+                            "created": int(time.time()),
+                            "owned_by": "local",
+                        }
+                    ],
+                })
+                return
+            self.send_error(404, "not found")
+
+        def do_POST(self) -> None:
+            if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
+                self.send_error(404, "not found")
+                return
+            length = int(self.headers.get("content-length", "0") or "0")
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                self.send_error(400, "invalid json")
+                return
+
+            user_text = extract_user_text(body)
+            print(f"[shim] received: {user_text!r}", file=sys.stderr, flush=True)
+
+            response_text = " "
+            if user_text:
+                command_response = handle_command(user_text, hosts)
+                if command_response is not None:
+                    response_text = command_response
+                    print(f"[shim] command -> {response_text!r}",
+                          file=sys.stderr, flush=True)
+                else:
+                    try:
+                        do_inject(user_text)
+                        print("[shim] injected", file=sys.stderr, flush=True)
+                    except subprocess.CalledProcessError as err:
+                        response_text = f"Injection failed: {err}"
+                        print(f"[shim] {response_text}",
+                              file=sys.stderr, flush=True)
+
+            stream = bool(body.get("stream"))
+            non_stream, chunks = build_completion(response_text, body)
+
+            if stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                for chunk in chunks:
+                    self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            else:
+                data = json.dumps(non_stream).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+    return Handler
+
+
+def main() -> None:
+    hosts = load_hosts()
+    handler = make_handler(hosts)
+    server = ThreadingHTTPServer((BIND, PORT), handler)
+    host, session = load_target()
+    print(
+        f"[shim] listening {BIND}:{PORT}  initial target: "
+        f"{describe_target(host, session)}  hosts: {list(hosts)}",
+        file=sys.stderr, flush=True,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("[shim] shutting down", file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    main()

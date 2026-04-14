@@ -1,0 +1,14 @@
+[Unit]
+Description=tmux voice-injection bridge (HA Assist -> tmux pane)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/tmux-voice-bridge
+Environment=TMUX_VOICE_PORT=18790
+Environment=TMUX_VOICE_BIND=127.0.0.1
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
