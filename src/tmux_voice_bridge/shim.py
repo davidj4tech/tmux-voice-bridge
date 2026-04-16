@@ -98,22 +98,114 @@ def describe_target(host: str | None, session: str) -> str:
 
 
 SWITCH_RE = re.compile(
-    r"^\s*(?:switch\s+to|use|go\s+to)\s+([a-z0-9]+)(?:\s+([a-z0-9][a-z0-9_\-]*))?\s*[.!?]?\s*$",
+    r"^\s*(?:switch\s+to|use|go\s+to)\s+([a-z0-9]+)(?:\s+(.+?))?\s*[.!?]?\s*$",
     re.IGNORECASE,
 )
 WHERE_RE = re.compile(
     r"^\s*(?:where\s+am\s+i|current\s+target|what\s+target|where\s+are\s+we)\s*[.!?]?\s*$",
     re.IGNORECASE,
 )
+LIST_RE = re.compile(
+    r"^\s*(?:list\s+sessions?|what\s+sessions?|show\s+sessions?)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
 
 
-def parse_session_token(tok: str | None) -> str:
+def _normalize(s: str) -> str:
+    """Collapse a string for fuzzy comparison: lowercase, strip separators."""
+    return re.sub(r"[\s\-_]+", "", s.lower())
+
+
+def list_sessions(host: str | None) -> list[str]:
+    """Return tmux session names on the given host (None = local)."""
+    cmd = ["tmux", "list-sessions", "-F", "#{session_name}"]
+    try:
+        if host is None:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        else:
+            result = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host] + cmd,
+                capture_output=True, text=True, timeout=10,
+            )
+        if result.returncode == 0:
+            return [s for s in result.stdout.strip().splitlines() if s]
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return []
+
+
+def match_session(spoken: str, sessions: list[str]) -> str | None:
+    """Find the best matching session for a spoken token.
+
+    Tries, in order:
+      1. Exact match (case-insensitive)
+      2. Normalized match (collapse spaces/hyphens/underscores, case-insensitive)
+      3. Spoken words joined with hyphens or underscores
+    Returns the actual session name, or None.
+    """
+    spoken_lower = spoken.lower()
+    spoken_norm = _normalize(spoken)
+
+    # Exact case-insensitive
+    for s in sessions:
+        if s.lower() == spoken_lower:
+            return s
+
+    # Normalized (ignore separators)
+    for s in sessions:
+        if _normalize(s) == spoken_norm:
+            return s
+
+    # Try joining spoken words with common separators
+    words = spoken_lower.split()
+    if len(words) > 1:
+        for sep in ("-", "_", ""):
+            joined = sep.join(words)
+            for s in sessions:
+                if s.lower() == joined:
+                    return s
+
+    return None
+
+
+def parse_session_token(tok: str | None, host: str | None) -> tuple[str, str | None]:
+    """Parse a spoken session token into (session_name, warning_or_none).
+
+    Looks up real sessions on the target host and fuzzy-matches.
+    Returns the matched session name and an optional warning/info message.
+    """
     if not tok:
-        return "main"
-    tok = tok.lower()
-    if tok in NUMBER_WORDS:
-        return str(NUMBER_WORDS[tok])
-    return tok
+        return "main", None
+
+    tok_lower = tok.lower().strip()
+
+    # Handle number words
+    if tok_lower in NUMBER_WORDS:
+        tok_lower = str(NUMBER_WORDS[tok_lower])
+
+    sessions = list_sessions(host)
+    if not sessions:
+        # Can't verify — use the token as-is, normalized with hyphens
+        fallback = re.sub(r"\s+", "-", tok_lower)
+        return fallback, None
+
+    matched = match_session(tok_lower, sessions)
+    if matched:
+        return matched, None
+
+    # No match — also try number-word substitution on multi-word input
+    words = tok_lower.split()
+    subst = []
+    for w in words:
+        subst.append(str(NUMBER_WORDS[w]) if w in NUMBER_WORDS else w)
+    subst_str = "-".join(subst)
+    matched = match_session(subst_str, sessions)
+    if matched:
+        return matched, None
+
+    available = ", ".join(sorted(sessions))
+    fallback = re.sub(r"\s+", "-", tok_lower)
+    return fallback, f"No session matching '{tok}' found. Available: {available}. Trying '{fallback}'."
 
 
 def handle_command(text: str, hosts: dict[str, str | None]) -> str | None:
@@ -125,12 +217,23 @@ def handle_command(text: str, hosts: dict[str, str | None]) -> str | None:
             known = ", ".join(sorted(hosts)) or "(no hosts configured)"
             return f"Unknown target {token}. Try: {known}."
         host = hosts[token]
-        session = parse_session_token(m.group(2))
+        session, warning = parse_session_token(m.group(2), host)
         save_target(host, session)
-        return f"Switched to {describe_target(host, session)}."
+        msg = f"Switched to {describe_target(host, session)}."
+        if warning:
+            msg = f"{warning} {msg}"
+        return msg
     if WHERE_RE.match(text):
         host, session = load_target()
         return f"Current target is {describe_target(host, session)}."
+    if LIST_RE.match(text):
+        host, session = load_target()
+        sessions = list_sessions(host)
+        if sessions:
+            names = ", ".join(sorted(sessions))
+            where = "locally" if host is None else f"on {host}"
+            return f"Sessions {where}: {names}."
+        return "No sessions found."
     return None
 
 
