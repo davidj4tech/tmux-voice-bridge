@@ -96,9 +96,11 @@ grammar swallowing natural speech.
 ### Anything else
 
 Is injected as keystrokes into the current target pane: clear line
-(`C-u`), type the text, press Enter. The HTTP response is a single space
-so HA's TTS stays silent — replies should come from the target tool's
-TTS hook.
+(`C-u`), type the text, press Enter. The HTTP response is a one-line
+confirmation — `Sent to <host> session <name>.` — so HA's UI always
+shows where the message went (otherwise the chat just shows a blank
+reply). Substantive replies come from the target tool's own TTS hook,
+not from this confirmation.
 
 ## HA wiring
 

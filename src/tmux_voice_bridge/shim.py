@@ -399,7 +399,9 @@ def make_handler(hosts: dict[str, str | None]):
                 else:
                     try:
                         do_inject(user_text)
-                        print("[shim] injected", file=sys.stderr, flush=True)
+                        host, session = load_target()
+                        response_text = f"Sent to {describe_target(host, session)}."
+                        print(f"[shim] injected -> {response_text!r}", file=sys.stderr, flush=True)
                     except subprocess.CalledProcessError as err:
                         response_text = f"Injection failed: {err}"
                         print(f"[shim] {response_text}",
