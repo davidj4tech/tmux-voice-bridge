@@ -87,35 +87,11 @@ where are we
 
 Spoken reply: "Current target is &lt;host&gt; session &lt;name&gt;."
 
-### LLM-assisted routing (optional fallback)
-
-Strict regex parsing is fast and free, but it only handles the literal
-verbs above with a known host token. For everything else — fuzzy phrasing
-("jump to the audio relay box"), unknown host tokens that *almost* match
-something real, or sessions you can't remember the exact name of — the
-bridge can fall back to Claude Code as a routing oracle.
-
-Enable by setting `TMUX_VOICE_LLM_ROUTER=claude` in the systemd unit and
-restarting. The fallback fires only when:
-
-1. A strict `switch to <X>` parsed cleanly but `<X>` isn't in `hosts.json`, **or**
-2. A looser switch-like phrase matched (verbs: `switch`, `use`, `go to`,
-   `jump to`, `take me to`, `move to`) but the strict parser couldn't
-   pull a usable `(host, session)` out of it.
-
-When it fires, the bridge shells out to `claude -p …` with the spoken
-phrase and the current `hosts.json` plus live tmux sessions per host,
-and asks for a single line `<host>\t<session>`. Claude's reply is
-validated against the host map before applying. If Claude returns `none`
-or an unknown host, the normal "Unknown target" error is spoken instead.
-
-Plain non-switch utterances ("yes", "run the tests", "no scroll up")
-never trigger the LLM — they go straight to the current target as
-keystrokes, same as before. So the LLM cost is only paid on routing
-ambiguity, not every sentence.
-
-Requires the `claude` CLI on `$PATH` for the user running the bridge,
-authenticated and able to run non-interactively.
+An utterance that *starts* with a switch verb but whose first token isn't
+a known host (e.g. "use my GTD inbox", "go to line 42") is **not** treated
+as a malformed switch command — it falls through to plain text injection,
+so it just gets typed into the current pane. This avoids the verb-prefix
+grammar swallowing natural speech.
 
 ### Anything else
 
@@ -168,8 +144,6 @@ the phone. Codex and others need their own equivalent.
 | `TMUX_VOICE_BIND` | `127.0.0.1` | Bind address |
 | `TMUX_VOICE_TARGET_FILE` | `$XDG_STATE_HOME/tmux-voice-bridge/target` | Persisted current target |
 | `TMUX_VOICE_HOSTS_FILE` | `$XDG_CONFIG_HOME/tmux-voice-bridge/hosts.json` | Host map |
-| `TMUX_VOICE_LLM_ROUTER` | *(empty)* | Set to `claude` to enable LLM fallback routing for ambiguous switch phrases |
-| `TMUX_VOICE_LLM_ROUTER_TIMEOUT` | `15` | Seconds to wait for the LLM to reply before giving up |
 
 ## Prerequisites for a new session
 
