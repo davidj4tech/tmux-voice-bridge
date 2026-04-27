@@ -98,7 +98,7 @@ def describe_target(host: str | None, session: str) -> str:
 
 
 SWITCH_RE = re.compile(
-    r"^\s*(?:switch\s+to|use|go\s+to)\s+([a-z0-9]+)(?:\s+(.+?))?\s*[.!?]?\s*$",
+    r"^\s*(?:switch\s+to|use|go\s+to)\s+([a-z0-9-]+)(?:\s+(.+?))?\s*[.!?]?\s*$",
     re.IGNORECASE,
 )
 WHERE_RE = re.compile(
@@ -109,6 +109,60 @@ LIST_RE = re.compile(
     r"^\s*(?:list\s+sessions?|what\s+sessions?|show\s+sessions?)\s*[.!?]?\s*$",
     re.IGNORECASE,
 )
+SWITCH_FUZZY_RE = re.compile(
+    r"^\s*(?:switch(?:\s+to)?|use|go(?:\s+to)?|jump\s+to|take\s+me\s+to|move\s+to)\s+(.+?)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+LLM_ROUTER = os.environ.get("TMUX_VOICE_LLM_ROUTER", "").strip().lower()
+LLM_ROUTER_TIMEOUT = float(os.environ.get("TMUX_VOICE_LLM_ROUTER_TIMEOUT", "15"))
+
+
+def llm_route(phrase: str, hosts: dict[str, str | None]) -> tuple[str, str] | None:
+    """Ask Claude Code (or another LLM) to map a fuzzy switch phrase to (host, session).
+
+    Returns (host_token, session_token) on success, or None.
+    Enabled when TMUX_VOICE_LLM_ROUTER is set (currently only "claude" is wired up).
+    """
+    if LLM_ROUTER != "claude":
+        return None
+    host_lines = []
+    for tok, ssh_target in sorted(hosts.items()):
+        sessions = list_sessions(ssh_target)
+        sess_str = ", ".join(sessions) if sessions else "(none reachable)"
+        host_lines.append(f"  - {tok}: sessions = [{sess_str}]")
+    prompt = (
+        "You are routing a voice command to a tmux pane.\n"
+        "Hosts and their current tmux sessions:\n"
+        + "\n".join(host_lines)
+        + f"\n\nUser said: {phrase!r}\n\n"
+        "Reply with EXACTLY one line: '<host_token>\\t<session_name>'.\n"
+        "Use only host_tokens from the list above. Pick the closest matching session\n"
+        "or invent a reasonable name if none match. If you cannot route, reply 'none'.\n"
+        "No prose, no markdown, no explanation."
+    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt],
+            capture_output=True, text=True, timeout=LLM_ROUTER_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        sys.stderr.write(f"llm_route: claude invocation failed: {exc}\n")
+        return None
+    if result.returncode != 0:
+        sys.stderr.write(f"llm_route: claude exit {result.returncode}: {result.stderr.strip()}\n")
+        return None
+    line = (result.stdout or "").strip().splitlines()[0:1]
+    if not line or line[0].lower() == "none":
+        return None
+    parts = re.split(r"[\t ]+", line[0].strip(), maxsplit=1)
+    if len(parts) != 2:
+        return None
+    host_tok, session = parts[0].lower(), parts[1].strip()
+    if host_tok not in hosts:
+        return None
+    return host_tok, session
+
 
 
 def _normalize(s: str) -> str:
@@ -210,19 +264,38 @@ def parse_session_token(tok: str | None, host: str | None) -> tuple[str, str | N
 
 def handle_command(text: str, hosts: dict[str, str | None]) -> str | None:
     """Return a spoken response if text matched a command, else None."""
-    m = SWITCH_RE.match(text)
-    if m:
-        token = m.group(1).lower()
-        if token not in hosts:
-            known = ", ".join(sorted(hosts)) or "(no hosts configured)"
-            return f"Unknown target {token}. Try: {known}."
+    def _do_switch(token: str, session_tok: str | None) -> str:
         host = hosts[token]
-        session, warning = parse_session_token(m.group(2), host)
+        session, warning = parse_session_token(session_tok, host)
         save_target(host, session)
         msg = f"Switched to {describe_target(host, session)}."
         if warning:
             msg = f"{warning} {msg}"
         return msg
+
+    m = SWITCH_RE.match(text)
+    if m:
+        token = m.group(1).lower()
+        session_tok = m.group(2)
+        if token not in hosts and "-" in token:
+            # Allow "host-session" as a single hyphenated token, e.g. "homer-aar".
+            head, _, tail = token.partition("-")
+            if head in hosts and tail:
+                token = head
+                session_tok = tail if not session_tok else f"{tail} {session_tok}"
+        if token in hosts:
+            return _do_switch(token, session_tok)
+        # Token not in hosts — try LLM fallback before erroring.
+        routed = llm_route(text, hosts)
+        if routed is not None:
+            return _do_switch(routed[0], routed[1])
+        known = ", ".join(sorted(hosts)) or "(no hosts configured)"
+        return f"Unknown target {token}. Try: {known}."
+    fuzzy = SWITCH_FUZZY_RE.match(text)
+    if fuzzy:
+        routed = llm_route(text, hosts)
+        if routed is not None:
+            return _do_switch(routed[0], routed[1])
     if WHERE_RE.match(text):
         host, session = load_target()
         return f"Current target is {describe_target(host, session)}."
