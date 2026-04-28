@@ -222,7 +222,19 @@ def handle_command(text: str, hosts: dict[str, str | None]) -> str | None:
             host = hosts[token]
             session, warning = parse_session_token(session_tok, host)
             save_target(host, session)
-            msg = f"Switched to {describe_target(host, session)}."
+            created = False
+            try:
+                if host is None:
+                    created = _ensure_session_local(session)
+                else:
+                    created = _ensure_session_remote(host, session)
+            except subprocess.CalledProcessError as err:
+                return (
+                    f"Switched to {describe_target(host, session)}, "
+                    f"but failed to create session: {err}."
+                )
+            verb = "Created and switched to" if created else "Switched to"
+            msg = f"{verb} {describe_target(host, session)}."
             if warning:
                 msg = f"{warning} {msg}"
             return msg
