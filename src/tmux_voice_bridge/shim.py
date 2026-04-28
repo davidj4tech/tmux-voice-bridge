@@ -305,7 +305,9 @@ def _ensure_session_local(session: str) -> bool:
 
 
 def _ensure_session_remote(host: str, session: str) -> bool:
-    check = f"tmux has-session -t ={session} 2>/dev/null"
+    # Single-quote the =NAME form so zsh on the remote side does not try
+    # to path-expand `=session` into a command lookup.
+    check = f"tmux has-session -t '={session}' 2>/dev/null"
     shell_cmd = _autostart_shell(session)
     create_steps = [f"tmux new-session -d -s {session}"]
     if shell_cmd:
