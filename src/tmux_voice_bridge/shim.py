@@ -245,6 +245,25 @@ def handle_command(text: str, hosts: dict[str, str | None]) -> str | None:
 
 AUTOSTART_CMD = os.environ.get("TMUX_VOICE_AUTOSTART_CMD", "cl")
 AUTOSTART_WAIT = float(os.environ.get("TMUX_VOICE_AUTOSTART_WAIT", "1.5"))
+PROJECTS_DIR = os.environ.get("TMUX_VOICE_PROJECTS_DIR", "$HOME/projects")
+OPT_DIR = os.environ.get("TMUX_VOICE_OPT_DIR", "/opt")
+TRUST_WAIT = float(os.environ.get("TMUX_VOICE_TRUST_WAIT", "4.0"))
+TRUST_AUTO = os.environ.get("TMUX_VOICE_TRUST_AUTO", "1") not in ("0", "", "false", "no")
+
+
+def _autostart_shell(session: str) -> str:
+    """Shell command sent to a freshly-created session.
+
+    Tries `$PROJECTS_DIR/<session>` then `$OPT_DIR/<session>`; falls through
+    to whatever the current shell directory is. Then runs AUTOSTART_CMD.
+    """
+    if not AUTOSTART_CMD:
+        return ""
+    return (
+        f"cd {PROJECTS_DIR}/{session} 2>/dev/null"
+        f" || cd {OPT_DIR}/{session} 2>/dev/null;"
+        f" {AUTOSTART_CMD}"
+    )
 
 
 def _ensure_session_local(session: str) -> bool:
@@ -256,24 +275,38 @@ def _ensure_session_local(session: str) -> bool:
     if r.returncode == 0:
         return False
     subprocess.run(["tmux", "new-session", "-d", "-s", session], check=True)
-    if AUTOSTART_CMD:
+    shell_cmd = _autostart_shell(session)
+    if shell_cmd:
+        target = f"{session}:1.1"
         subprocess.run(
-            ["tmux", "send-keys", "-t", f"{session}:1.1", AUTOSTART_CMD, "Enter"],
+            ["tmux", "send-keys", "-t", target, shell_cmd, "Enter"],
             check=True,
         )
         time.sleep(AUTOSTART_WAIT)
+        if TRUST_AUTO:
+            time.sleep(TRUST_WAIT)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", target, "Enter"],
+                check=True,
+            )
     return True
 
 
 def _ensure_session_remote(host: str, session: str) -> bool:
     check = f"tmux has-session -t ={session} 2>/dev/null"
-    create = (
-        f"tmux new-session -d -s {session}"
-        + (
-            f" && tmux send-keys -t {session}:1.1 {AUTOSTART_CMD} Enter && sleep {AUTOSTART_WAIT}"
-            if AUTOSTART_CMD else ""
+    shell_cmd = _autostart_shell(session)
+    create_steps = [f"tmux new-session -d -s {session}"]
+    if shell_cmd:
+        # Wrap shell_cmd in double quotes for tmux send-keys; the outer
+        # ssh command is single-quoted by the shell from Python's argv.
+        create_steps.append(
+            f'tmux send-keys -t {session}:1.1 "{shell_cmd}" Enter'
         )
-    )
+        create_steps.append(f"sleep {AUTOSTART_WAIT}")
+        if TRUST_AUTO:
+            create_steps.append(f"sleep {TRUST_WAIT}")
+            create_steps.append(f"tmux send-keys -t {session}:1.1 Enter")
+    create = " && ".join(create_steps)
     remote = f"if {check}; then exit 7; else {create}; fi"
     r = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", host, remote],
