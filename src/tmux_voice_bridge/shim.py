@@ -222,7 +222,19 @@ def handle_command(text: str, hosts: dict[str, str | None]) -> str | None:
             host = hosts[token]
             session, warning = parse_session_token(session_tok, host)
             save_target(host, session)
-            msg = f"Switched to {describe_target(host, session)}."
+            created = False
+            try:
+                if host is None:
+                    created = _ensure_session_local(session)
+                else:
+                    created = _ensure_session_remote(host, session)
+            except subprocess.CalledProcessError as err:
+                return (
+                    f"Switched to {describe_target(host, session)}, "
+                    f"but failed to create session: {err}."
+                )
+            verb = "Created and switched to" if created else "Switched to"
+            msg = f"{verb} {describe_target(host, session)}."
             if warning:
                 msg = f"{warning} {msg}"
             return msg
@@ -243,7 +255,88 @@ def handle_command(text: str, hosts: dict[str, str | None]) -> str | None:
     return None
 
 
+AUTOSTART_CMD = os.environ.get("TMUX_VOICE_AUTOSTART_CMD", "cl")
+AUTOSTART_WAIT = float(os.environ.get("TMUX_VOICE_AUTOSTART_WAIT", "1.5"))
+PROJECTS_DIR = os.environ.get("TMUX_VOICE_PROJECTS_DIR", "$HOME/projects")
+OPT_DIR = os.environ.get("TMUX_VOICE_OPT_DIR", "/opt")
+TRUST_WAIT = float(os.environ.get("TMUX_VOICE_TRUST_WAIT", "4.0"))
+TRUST_AUTO = os.environ.get("TMUX_VOICE_TRUST_AUTO", "1") not in ("0", "", "false", "no")
+
+
+def _autostart_shell(session: str) -> str:
+    """Shell command sent to a freshly-created session.
+
+    Tries `$PROJECTS_DIR/<session>` then `$OPT_DIR/<session>`; falls through
+    to whatever the current shell directory is. Then runs AUTOSTART_CMD.
+    """
+    if not AUTOSTART_CMD:
+        return ""
+    return (
+        f"cd {PROJECTS_DIR}/{session} 2>/dev/null"
+        f" || cd {OPT_DIR}/{session} 2>/dev/null;"
+        f" {AUTOSTART_CMD}"
+    )
+
+
+def _ensure_session_local(session: str) -> bool:
+    """Return True if a new session was just created."""
+    r = subprocess.run(
+        ["tmux", "has-session", "-t", f"={session}"],
+        capture_output=True,
+    )
+    if r.returncode == 0:
+        return False
+    subprocess.run(["tmux", "new-session", "-d", "-s", session], check=True)
+    shell_cmd = _autostart_shell(session)
+    if shell_cmd:
+        target = f"{session}:1.1"
+        subprocess.run(
+            ["tmux", "send-keys", "-t", target, shell_cmd, "Enter"],
+            check=True,
+        )
+        time.sleep(AUTOSTART_WAIT)
+        if TRUST_AUTO:
+            time.sleep(TRUST_WAIT)
+            subprocess.run(
+                ["tmux", "send-keys", "-t", target, "Enter"],
+                check=True,
+            )
+    return True
+
+
+def _ensure_session_remote(host: str, session: str) -> bool:
+    # Single-quote the =NAME form so zsh on the remote side does not try
+    # to path-expand `=session` into a command lookup.
+    check = f"tmux has-session -t '={session}' 2>/dev/null"
+    shell_cmd = _autostart_shell(session)
+    create_steps = [f"tmux new-session -d -s {session}"]
+    if shell_cmd:
+        # Wrap shell_cmd in double quotes for tmux send-keys; the outer
+        # ssh command is single-quoted by the shell from Python's argv.
+        create_steps.append(
+            f'tmux send-keys -t {session}:1.1 "{shell_cmd}" Enter'
+        )
+        create_steps.append(f"sleep {AUTOSTART_WAIT}")
+        if TRUST_AUTO:
+            create_steps.append(f"sleep {TRUST_WAIT}")
+            create_steps.append(f"tmux send-keys -t {session}:1.1 Enter")
+    create = " && ".join(create_steps)
+    remote = f"if {check}; then exit 7; else {create}; fi"
+    r = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", host, remote],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 7:
+        return False
+    if r.returncode != 0:
+        raise subprocess.CalledProcessError(
+            r.returncode, ["ssh", host, "ensure-session", session], r.stdout, r.stderr,
+        )
+    return True
+
+
 def inject_local(session: str, text: str) -> None:
+    _ensure_session_local(session)
     target = f"{session}:1.1"
     buf = f"voice-{uuid.uuid4().hex[:8]}"
     subprocess.run(
@@ -259,6 +352,7 @@ def inject_local(session: str, text: str) -> None:
 
 
 def inject_remote(host: str, session: str, text: str) -> None:
+    _ensure_session_remote(host, session)
     target = f"{session}:1.1"
     buf = f"voice-{uuid.uuid4().hex[:8]}"
     remote = (
