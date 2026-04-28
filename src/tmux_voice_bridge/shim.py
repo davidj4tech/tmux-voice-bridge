@@ -243,7 +243,53 @@ def handle_command(text: str, hosts: dict[str, str | None]) -> str | None:
     return None
 
 
+AUTOSTART_CMD = os.environ.get("TMUX_VOICE_AUTOSTART_CMD", "cl")
+AUTOSTART_WAIT = float(os.environ.get("TMUX_VOICE_AUTOSTART_WAIT", "1.5"))
+
+
+def _ensure_session_local(session: str) -> bool:
+    """Return True if a new session was just created."""
+    r = subprocess.run(
+        ["tmux", "has-session", "-t", f"={session}"],
+        capture_output=True,
+    )
+    if r.returncode == 0:
+        return False
+    subprocess.run(["tmux", "new-session", "-d", "-s", session], check=True)
+    if AUTOSTART_CMD:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", f"{session}:1.1", AUTOSTART_CMD, "Enter"],
+            check=True,
+        )
+        time.sleep(AUTOSTART_WAIT)
+    return True
+
+
+def _ensure_session_remote(host: str, session: str) -> bool:
+    check = f"tmux has-session -t ={session} 2>/dev/null"
+    create = (
+        f"tmux new-session -d -s {session}"
+        + (
+            f" && tmux send-keys -t {session}:1.1 {AUTOSTART_CMD} Enter && sleep {AUTOSTART_WAIT}"
+            if AUTOSTART_CMD else ""
+        )
+    )
+    remote = f"if {check}; then exit 7; else {create}; fi"
+    r = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", host, remote],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 7:
+        return False
+    if r.returncode != 0:
+        raise subprocess.CalledProcessError(
+            r.returncode, ["ssh", host, "ensure-session", session], r.stdout, r.stderr,
+        )
+    return True
+
+
 def inject_local(session: str, text: str) -> None:
+    _ensure_session_local(session)
     target = f"{session}:1.1"
     buf = f"voice-{uuid.uuid4().hex[:8]}"
     subprocess.run(
@@ -259,6 +305,7 @@ def inject_local(session: str, text: str) -> None:
 
 
 def inject_remote(host: str, session: str, text: str) -> None:
+    _ensure_session_remote(host, session)
     target = f"{session}:1.1"
     buf = f"voice-{uuid.uuid4().hex[:8]}"
     remote = (
