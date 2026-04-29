@@ -289,16 +289,18 @@ def _ensure_session_local(session: str) -> bool:
     subprocess.run(["tmux", "new-session", "-d", "-s", session], check=True)
     shell_cmd = _autostart_shell(session)
     if shell_cmd:
-        target = f"{session}:1.1"
+        # Use the session name directly so tmux targets whatever the user's
+        # base-index / pane-base-index are. Hard-coding `:1.1` breaks for
+        # users on default tmux config (base-index = 0).
         subprocess.run(
-            ["tmux", "send-keys", "-t", target, shell_cmd, "Enter"],
+            ["tmux", "send-keys", "-t", session, shell_cmd, "Enter"],
             check=True,
         )
         time.sleep(AUTOSTART_WAIT)
         if TRUST_AUTO:
             time.sleep(TRUST_WAIT)
             subprocess.run(
-                ["tmux", "send-keys", "-t", target, "Enter"],
+                ["tmux", "send-keys", "-t", session, "Enter"],
                 check=True,
             )
     return True
@@ -311,15 +313,17 @@ def _ensure_session_remote(host: str, session: str) -> bool:
     shell_cmd = _autostart_shell(session)
     create_steps = [f"tmux new-session -d -s {session}"]
     if shell_cmd:
+        # Target the session by name so tmux uses the active window/pane
+        # under the remote user's tmux config (base-index may be 0 or 1).
         # Wrap shell_cmd in double quotes for tmux send-keys; the outer
         # ssh command is single-quoted by the shell from Python's argv.
         create_steps.append(
-            f'tmux send-keys -t {session}:1.1 "{shell_cmd}" Enter'
+            f'tmux send-keys -t {session} "{shell_cmd}" Enter'
         )
         create_steps.append(f"sleep {AUTOSTART_WAIT}")
         if TRUST_AUTO:
             create_steps.append(f"sleep {TRUST_WAIT}")
-            create_steps.append(f"tmux send-keys -t {session}:1.1 Enter")
+            create_steps.append(f"tmux send-keys -t {session} Enter")
     create = " && ".join(create_steps)
     remote = f"if {check}; then exit 7; else {create}; fi"
     r = subprocess.run(
@@ -337,7 +341,7 @@ def _ensure_session_remote(host: str, session: str) -> bool:
 
 def inject_local(session: str, text: str) -> None:
     _ensure_session_local(session)
-    target = f"{session}:1.1"
+    target = session
     buf = f"voice-{uuid.uuid4().hex[:8]}"
     subprocess.run(
         ["tmux", "load-buffer", "-b", buf, "-"],
@@ -353,7 +357,7 @@ def inject_local(session: str, text: str) -> None:
 
 def inject_remote(host: str, session: str, text: str) -> None:
     _ensure_session_remote(host, session)
-    target = f"{session}:1.1"
+    target = session
     buf = f"voice-{uuid.uuid4().hex[:8]}"
     remote = (
         f"tmux load-buffer -b {buf} - && "
