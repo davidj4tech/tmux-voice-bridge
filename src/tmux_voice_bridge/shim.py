@@ -233,8 +233,12 @@ def handle_command(text: str, hosts: dict[str, str | None]) -> str | None:
                     f"Switched to {describe_target(host, session)}, "
                     f"but failed to create session: {err}."
                 )
-            verb = "Created and switched to" if created else "Switched to"
-            msg = f"{verb} {describe_target(host, session)}."
+            if created:
+                # Distinct verb so the audible reply makes it obvious this
+                # wasn't an existing session you switched into.
+                msg = f"Created {describe_target(host, session)}."
+            else:
+                msg = f"Switched to {describe_target(host, session)}."
             if warning:
                 msg = f"{warning} {msg}"
             return msg
