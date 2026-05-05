@@ -146,6 +146,7 @@ the phone. Codex and others need their own equivalent.
 | `TMUX_VOICE_BIND` | `127.0.0.1` | Bind address |
 | `TMUX_VOICE_TARGET_FILE` | `$XDG_STATE_HOME/tmux-voice-bridge/target` | Persisted current target |
 | `TMUX_VOICE_HOSTS_FILE` | `$XDG_CONFIG_HOME/tmux-voice-bridge/hosts.json` | Host map |
+| `TMUX_VOICE_ENTER_DELAY` | `0.12` | Seconds between paste-buffer and the trailing `Enter`. Avoids a race where TUIs (e.g. Claude Code's Ink renderer) absorb `Enter` into the pasted text instead of submitting. Set to `0` to disable. |
 
 ## Prerequisites for a new session
 

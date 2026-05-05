@@ -265,6 +265,7 @@ PROJECTS_DIR = os.environ.get("TMUX_VOICE_PROJECTS_DIR", "$HOME/projects")
 OPT_DIR = os.environ.get("TMUX_VOICE_OPT_DIR", "/opt")
 TRUST_WAIT = float(os.environ.get("TMUX_VOICE_TRUST_WAIT", "4.0"))
 TRUST_AUTO = os.environ.get("TMUX_VOICE_TRUST_AUTO", "1") not in ("0", "", "false", "no")
+ENTER_DELAY = float(os.environ.get("TMUX_VOICE_ENTER_DELAY", "0.12"))
 
 
 def _autostart_shell(session: str) -> str:
@@ -356,6 +357,8 @@ def inject_local(session: str, text: str) -> None:
         ["tmux", "paste-buffer", "-b", buf, "-d", "-t", target],
         check=True,
     )
+    if ENTER_DELAY > 0:
+        time.sleep(ENTER_DELAY)
     subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
 
 
@@ -363,10 +366,12 @@ def inject_remote(host: str, session: str, text: str) -> None:
     _ensure_session_remote(host, session)
     target = session
     buf = f"voice-{uuid.uuid4().hex[:8]}"
+    settle = f"sleep {ENTER_DELAY} && " if ENTER_DELAY > 0 else ""
     remote = (
         f"tmux load-buffer -b {buf} - && "
         f"tmux send-keys -t {target} C-u && "
         f"tmux paste-buffer -b {buf} -d -t {target} && "
+        f"{settle}"
         f"tmux send-keys -t {target} Enter"
     )
     subprocess.run(
