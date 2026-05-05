@@ -259,7 +259,7 @@ def handle_command(text: str, hosts: dict[str, str | None]) -> str | None:
     return None
 
 
-AUTOSTART_CMD = os.environ.get("TMUX_VOICE_AUTOSTART_CMD", "cl")
+AUTOSTART_CMD = os.environ.get("TMUX_VOICE_AUTOSTART_CMD", "claude --dangerously-skip-permissions")
 AUTOSTART_WAIT = float(os.environ.get("TMUX_VOICE_AUTOSTART_WAIT", "1.5"))
 PROJECTS_DIR = os.environ.get("TMUX_VOICE_PROJECTS_DIR", "$HOME/projects")
 OPT_DIR = os.environ.get("TMUX_VOICE_OPT_DIR", "/opt")
